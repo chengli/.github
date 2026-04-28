@@ -28,8 +28,9 @@
 # complexity ARE namespaced (`phase:*`, `complexity:*`).
 #
 # Notes:
-#   - Title-prefix matching is case-sensitive (conventional commits are
-#     lowercase). Scoped form `fix(api):` matches via regex.
+#   - Title-prefix matching is CASE-INSENSITIVE: "Fix:" and "FIX:" match
+#     too. Real-world authors mix title-case despite conventional-commits
+#     preference for lowercase. Scoped form `fix(api):` matches via regex.
 #   - This script ONLY proposes labels. Combining with existing labels
 #     (only-add semantics) is `apply-labels.sh`'s job.
 
@@ -48,8 +49,10 @@ type=""
 # Accept: prefix:, prefix(scope):
 # fix / bugfix / hotfix → bug
 # docs / doc → documentation
-# else → enhancement (default)
+# else → undecided (LLM will weigh in)
+# Case-insensitive match — see note in module header.
 # (Regex stored in variables to dodge bash 3.2 quoting quirks.)
+shopt -s nocasematch
 re_bug='^(fix|bugfix|hotfix)(\([^)]+\))?:'
 re_docs='^(docs|doc)(\([^)]+\))?:'
 if [[ "$TITLE_TRIMMED" =~ $re_bug ]]; then
@@ -60,31 +63,20 @@ elif [[ "$TITLE_TRIMMED" =~ $re_docs ]]; then
   # under-50 LOC changes" — doc fixes qualify; mark complexity simple.
   complexity="complexity:simple"
 fi
+shopt -u nocasematch
 
 # Phase default: phase:think (per /github-spec convention)
 phase="phase:think"
 
-# Complexity default: standard, unless heuristic-narrowed above
-if [[ -z "$complexity" ]]; then
-  # We do NOT default complexity here because phases.yaml says simple is
-  # *also* valid for "renames, or single-file under-50 LOC changes" —
-  # neither of which we can detect from title alone. Leave empty so the
-  # LLM (or final fallback) chooses standard vs simple based on body.
-  complexity=""
-fi
+# Complexity is intentionally left empty when not narrowed by the docs
+# rule above — phases.yaml says simple is also valid for renames or
+# single-file under-50-LOC changes, neither of which we can detect from
+# title alone. The LLM (or final hardcoded fallback) chooses standard vs
+# simple based on body content.
 
-# If type still empty (no fix/docs prefix), heuristic alone yields
-# enhancement. But edge cases (feature requests with non-standard
-# prefixes, e.g. "feat:", "refactor:") may want LLM input on whether
-# they're truly enhancement vs something else. Per phases.yaml the
-# DEFAULT is enhancement, so we set it as a safe fallback only if the
-# LLM step fails.
-if [[ -z "$type" ]]; then
-  # Conservative: don't decide here, let LLM weigh in.
-  type=""
-fi
-
-# Decide whether LLM is needed
+# Decide whether LLM is needed. Phase is always set above, so this is
+# effectively (complexity-empty OR type-empty); listed in full for
+# clarity and to keep the contract explicit.
 need_llm="false"
 if [[ -z "$phase" || -z "$complexity" || -z "$type" ]]; then
   need_llm="true"

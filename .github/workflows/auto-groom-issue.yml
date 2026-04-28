@@ -1,6 +1,6 @@
 # auto-groom-issue.yml — reusable workflow that auto-applies dispatcher-
-# required labels (phase:* + complexity:* + type:*) to newly opened
-# GitHub issues in fleet repos.
+# required labels (phase:* + complexity:* + bug|enhancement|documentation)
+# to newly opened GitHub issues in fleet repos.
 #
 # Why: the v3 dispatcher silently skips any issue missing one of the
 # three label categories. Today multiple entry paths (gh CLI, web UI,
@@ -11,6 +11,13 @@
 # when heuristic can't fill all three. Author-set labels are always
 # preserved (only-ADD semantics).
 #
+# Security model: groom_repo / groom_ref are HARDCODED (not workflow_call
+# inputs) so a hostile caller cannot point script execution at attacker-
+# controlled code. aws_role_arn IS a caller input but the actual security
+# boundary is the AWS IAM trust policy on that role (it locks the
+# `repo:OWNER/NAME:*` claim from the OIDC token); a malicious caller
+# passing an unauthorized ARN gets AccessDenied from STS.
+#
 # Caller pattern (per fleet repo, .github/workflows/groom.yml):
 #
 #   name: Auto-groom new issues
@@ -19,7 +26,7 @@
 #       types: [opened]
 #   jobs:
 #     groom:
-#       uses: chengli/.github/.github/workflows/auto-groom-issue.yml@main
+#       uses: chengli/.github/.github/workflows/auto-groom-issue.yml@v1
 #       with:
 #         aws_role_arn: arn:aws:iam::740838937338:role/agent-workflow-gh-actions-groomer
 
@@ -31,7 +38,7 @@ on:
       aws_role_arn:
         type: string
         required: true
-        description: ARN of IAM role to assume via OIDC for SM access.
+        description: ARN of IAM role to assume via OIDC for SM access. Trust policy on the role is the authoritative security boundary.
       aws_region:
         type: string
         required: false
@@ -44,15 +51,12 @@ on:
         type: string
         required: false
         default: claude-sonnet-4-6
-      groom_repo:
-        type: string
-        required: false
-        default: chengli/.github
-        description: Repo holding scripts/ used by this workflow.
-      groom_ref:
-        type: string
-        required: false
-        default: main
+
+env:
+  # Pinned to this repo + a stable ref so script source can never be
+  # caller-supplied. Update via PR + retag if chengli/.github moves.
+  GROOM_REPO: chengli/.github
+  GROOM_REF: v1
 
 jobs:
   groom:
@@ -67,8 +71,8 @@ jobs:
       - name: Checkout groomer scripts
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.groom_repo }}
-          ref: ${{ inputs.groom_ref }}
+          repository: ${{ env.GROOM_REPO }}
+          ref: ${{ env.GROOM_REF }}
           path: groomer
           persist-credentials: false
 
@@ -92,27 +96,28 @@ jobs:
           SM_SECRET_ID: ${{ inputs.sm_secret_id }}
         run: |
           set -euo pipefail
-          # Use --output text to dodge JSON-escape gotchas; the secret
-          # value is itself JSON. Mask the whole blob to scrub it from
-          # any subsequent log lines.
+          # Compact the JSON to a single line so masking + handling don't
+          # depend on whitespace formatting of the SM secret.
           BLOB=$(aws secretsmanager get-secret-value \
             --secret-id "$SM_SECRET_ID" \
             --query SecretString \
-            --output text)
-          if [[ -z "$BLOB" ]]; then
+            --output text \
+            | jq -c .)
+          if [[ -z "$BLOB" || "$BLOB" == "null" ]]; then
             echo "::warning::SM blob empty — falling back without LLM" >&2
             echo "ok=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "::add-mask::$BLOB"
-          # Also mask the access token specifically since it'll appear
-          # in nested CLI calls.
-          TOKEN=$(printf '%s' "$BLOB" | jq -r '.claudeAiOauth.accessToken // empty')
-          if [[ -n "$TOKEN" ]]; then
-            echo "::add-mask::$TOKEN"
-          fi
+          # Mask the individual sensitive fields rather than the full
+          # blob: GitHub Actions ::add-mask:: matches per-line, so a
+          # multi-line mask leaks any line after the first. Extracting
+          # each token and masking it directly is reliable.
+          ACCESS_TOKEN=$(printf '%s' "$BLOB" | jq -r '.claudeAiOauth.accessToken // empty')
+          REFRESH_TOKEN=$(printf '%s' "$BLOB" | jq -r '.claudeAiOauth.refreshToken // empty')
+          [[ -n "$ACCESS_TOKEN" ]] && echo "::add-mask::$ACCESS_TOKEN"
+          [[ -n "$REFRESH_TOKEN" ]] && echo "::add-mask::$REFRESH_TOKEN"
           # Write to a runner-temp file rather than GITHUB_OUTPUT to
-          # avoid masking-fragile multi-line value passing.
+          # keep the blob out of any logs.
           CRED_FILE="$RUNNER_TEMP/claude-credentials.json"
           umask 077
           printf '%s' "$BLOB" > "$CRED_FILE"
@@ -129,24 +134,35 @@ jobs:
           CREDENTIALS_FILE: ${{ steps.sm.outputs.cred_file }}
         run: bash groomer/scripts/llm-classify.sh >> "$GITHUB_OUTPUT"
 
+      - name: Surface LLM status
+        if: always() && steps.heuristic.outputs.need_llm == 'true'
+        env:
+          LLM_STATUS: ${{ steps.llm.outputs.llm_status }}
+        run: |
+          if [[ "$LLM_STATUS" == "ok" ]]; then
+            echo "::notice::LLM classify succeeded"
+          elif [[ "$LLM_STATUS" == "fail" ]]; then
+            echo "::warning::LLM classify failed — using safe defaults (phase:think + complexity:standard + enhancement)"
+          fi
+
       - name: Compose proposed labels
         id: compose
         env:
-          # Heuristic outputs (may be empty per category)
           H_PHASE: ${{ steps.heuristic.outputs.add_phase }}
           H_COMPLEXITY: ${{ steps.heuristic.outputs.add_complexity }}
           H_TYPE: ${{ steps.heuristic.outputs.add_type }}
-          # LLM outputs (also empty if step skipped). Defaults below
-          # cover the case where both heuristic and LLM are silent.
           L_PHASE: ${{ steps.llm.outputs.llm_phase }}
           L_COMPLEXITY: ${{ steps.llm.outputs.llm_complexity }}
           L_TYPE: ${{ steps.llm.outputs.llm_type }}
         run: |
           set -euo pipefail
           # Heuristic wins; LLM fills gaps; hard-coded fallback last.
+          # Type fallback is UNPREFIXED (`enhancement`, not `type:enhancement`)
+          # because the project uses GitHub's default labels for the type
+          # category.
           PHASE="${H_PHASE:-${L_PHASE:-phase:think}}"
           COMPLEXITY="${H_COMPLEXITY:-${L_COMPLEXITY:-complexity:standard}}"
-          TYPE="${H_TYPE:-${L_TYPE:-type:enhancement}}"
+          TYPE="${H_TYPE:-${L_TYPE:-enhancement}}"
           {
             echo "phase=$PHASE"
             echo "complexity=$COMPLEXITY"

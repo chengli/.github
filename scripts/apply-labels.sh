@@ -80,26 +80,61 @@ maybe_add_prefix "$PROPOSE_PHASE" "phase:"
 maybe_add_prefix "$PROPOSE_COMPLEXITY" "complexity:"
 maybe_add_type "$PROPOSE_TYPE"
 
+# Helper: serialize a bash array to a JSON array. Handles the empty
+# case explicitly because `printf '%s\n' "${arr[@]:-}"` emits an empty
+# line in bash, which jq -s would turn into `[""]`.
+arr_to_json() {
+  local -n _arr=$1
+  if [[ "${#_arr[@]}" -eq 0 ]]; then
+    printf '[]'
+  else
+    printf '%s\n' "${_arr[@]}" | jq -R . | jq -s .
+  fi
+}
+
 if [[ "${#to_add[@]}" -eq 0 ]]; then
-  echo "{\"action\":\"noop\",\"existing\":$existing_json,\"skipped\":$(printf '%s\n' "${skipped[@]}" | jq -R . | jq -s .)}"
+  printf '{"action":"noop","existing":%s,"skipped":%s}\n' \
+    "$existing_json" "$(arr_to_json skipped)"
   exit 0
 fi
 
-# 2. Apply via gh. We use --add-label which is purely additive and
-#    leaves existing labels alone (gh CLI behavior).
-add_args=()
+# 2. Apply via gh, ONE LABEL AT A TIME so that a missing label on the
+#    repo doesn't fail the whole batch (and the workflow). The dispatcher
+#    creates phase:* and complexity:* labels by convention, but this
+#    workflow is the safety net for repos that haven't been bootstrapped
+#    yet — be tolerant.
+added=()
+not_found=()
+
+apply_one() {
+  local label="$1"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '[dry-run] gh issue edit %s --repo %s --add-label %q\n' "$ISSUE" "$REPO" "$label" >&2
+    added+=("$label")
+    return
+  fi
+  local err
+  if err=$(gh issue edit "$ISSUE" --repo "$REPO" --add-label "$label" 2>&1 >/dev/null); then
+    added+=("$label")
+  else
+    # gh prints "could not add label: <name> not found" on missing labels.
+    if printf '%s' "$err" | grep -qiE 'not found|could not add label'; then
+      echo "::warning::label '$label' does not exist on $REPO — skipping (run \`gh label create $label\` to enable)" >&2
+      not_found+=("$label")
+    else
+      # Other failures (rate limit, auth) — re-raise.
+      printf '%s\n' "$err" >&2
+      return 1
+    fi
+  fi
+}
+
 for l in "${to_add[@]}"; do
-  add_args+=(--add-label "$l")
+  apply_one "$l"
 done
 
-if [[ "$DRY_RUN" == "1" ]]; then
-  printf '[dry-run] gh issue edit %s --repo %s' "$ISSUE" "$REPO" >&2
-  for a in "${add_args[@]}"; do printf ' %q' "$a" >&2; done
-  printf '\n' >&2
-else
-  gh issue edit "$ISSUE" --repo "$REPO" "${add_args[@]}" >&2
-fi
-
-added_json=$(printf '%s\n' "${to_add[@]}" | jq -R . | jq -s .)
-skipped_json=$(printf '%s\n' "${skipped[@]:-}" | jq -R . | jq -s 'map(select(length>0))')
-echo "{\"action\":\"added\",\"added\":$added_json,\"skipped\":$skipped_json,\"existing\":$existing_json}"
+printf '{"action":"applied","added":%s,"not_found":%s,"skipped":%s,"existing":%s}\n' \
+  "$(arr_to_json added)" \
+  "$(arr_to_json not_found)" \
+  "$(arr_to_json skipped)" \
+  "$existing_json"
