@@ -1,0 +1,165 @@
+# auto-groom-issue.yml — reusable workflow that auto-applies dispatcher-
+# required labels (phase:* + complexity:* + type:*) to newly opened
+# GitHub issues in fleet repos.
+#
+# Why: the v3 dispatcher silently skips any issue missing one of the
+# three label categories. Today multiple entry paths (gh CLI, web UI,
+# /github-spec, agents) can produce non-conforming issues with no
+# warning. This workflow is the safety net.
+#
+# Strategy: heuristic-first (deterministic, ~free) → LLM-fallback only
+# when heuristic can't fill all three. Author-set labels are always
+# preserved (only-ADD semantics).
+#
+# Caller pattern (per fleet repo, .github/workflows/groom.yml):
+#
+#   name: Auto-groom new issues
+#   on:
+#     issues:
+#       types: [opened]
+#   jobs:
+#     groom:
+#       uses: chengli/.github/.github/workflows/auto-groom-issue.yml@main
+#       with:
+#         aws_role_arn: arn:aws:iam::740838937338:role/agent-workflow-gh-actions-groomer
+
+name: Auto-groom new issues
+
+on:
+  workflow_call:
+    inputs:
+      aws_role_arn:
+        type: string
+        required: true
+        description: ARN of IAM role to assume via OIDC for SM access.
+      aws_region:
+        type: string
+        required: false
+        default: us-east-1
+      sm_secret_id:
+        type: string
+        required: false
+        default: agent-workflow-v2/claude-auth-token
+      model:
+        type: string
+        required: false
+        default: claude-sonnet-4-6
+      groom_repo:
+        type: string
+        required: false
+        default: chengli/.github
+        description: Repo holding scripts/ used by this workflow.
+      groom_ref:
+        type: string
+        required: false
+        default: main
+
+jobs:
+  groom:
+    # Skip bot-opened issues per handoff out-of-scope rule.
+    if: github.event.issue.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write       # to add labels on the caller repo's issue
+      id-token: write     # to assume AWS role via OIDC
+      contents: read      # to checkout chengli/.github (scripts source)
+    steps:
+      - name: Checkout groomer scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.groom_repo }}
+          ref: ${{ inputs.groom_ref }}
+          path: groomer
+          persist-credentials: false
+
+      - name: Heuristic
+        id: heuristic
+        env:
+          TITLE: ${{ github.event.issue.title }}
+        run: bash groomer/scripts/heuristic.sh
+
+      - name: Configure AWS credentials
+        if: steps.heuristic.outputs.need_llm == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Fetch OAuth credentials from Secrets Manager
+        if: steps.heuristic.outputs.need_llm == 'true'
+        id: sm
+        env:
+          SM_SECRET_ID: ${{ inputs.sm_secret_id }}
+        run: |
+          set -euo pipefail
+          # Use --output text to dodge JSON-escape gotchas; the secret
+          # value is itself JSON. Mask the whole blob to scrub it from
+          # any subsequent log lines.
+          BLOB=$(aws secretsmanager get-secret-value \
+            --secret-id "$SM_SECRET_ID" \
+            --query SecretString \
+            --output text)
+          if [[ -z "$BLOB" ]]; then
+            echo "::warning::SM blob empty — falling back without LLM" >&2
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::add-mask::$BLOB"
+          # Also mask the access token specifically since it'll appear
+          # in nested CLI calls.
+          TOKEN=$(printf '%s' "$BLOB" | jq -r '.claudeAiOauth.accessToken // empty')
+          if [[ -n "$TOKEN" ]]; then
+            echo "::add-mask::$TOKEN"
+          fi
+          # Write to a runner-temp file rather than GITHUB_OUTPUT to
+          # avoid masking-fragile multi-line value passing.
+          CRED_FILE="$RUNNER_TEMP/claude-credentials.json"
+          umask 077
+          printf '%s' "$BLOB" > "$CRED_FILE"
+          echo "cred_file=$CRED_FILE" >> "$GITHUB_OUTPUT"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: LLM classify (Sonnet 4.6)
+        id: llm
+        if: steps.heuristic.outputs.need_llm == 'true' && steps.sm.outputs.ok == 'true'
+        env:
+          TITLE: ${{ github.event.issue.title }}
+          BODY: ${{ github.event.issue.body }}
+          MODEL: ${{ inputs.model }}
+          CREDENTIALS_FILE: ${{ steps.sm.outputs.cred_file }}
+        run: bash groomer/scripts/llm-classify.sh >> "$GITHUB_OUTPUT"
+
+      - name: Compose proposed labels
+        id: compose
+        env:
+          # Heuristic outputs (may be empty per category)
+          H_PHASE: ${{ steps.heuristic.outputs.add_phase }}
+          H_COMPLEXITY: ${{ steps.heuristic.outputs.add_complexity }}
+          H_TYPE: ${{ steps.heuristic.outputs.add_type }}
+          # LLM outputs (also empty if step skipped). Defaults below
+          # cover the case where both heuristic and LLM are silent.
+          L_PHASE: ${{ steps.llm.outputs.llm_phase }}
+          L_COMPLEXITY: ${{ steps.llm.outputs.llm_complexity }}
+          L_TYPE: ${{ steps.llm.outputs.llm_type }}
+        run: |
+          set -euo pipefail
+          # Heuristic wins; LLM fills gaps; hard-coded fallback last.
+          PHASE="${H_PHASE:-${L_PHASE:-phase:think}}"
+          COMPLEXITY="${H_COMPLEXITY:-${L_COMPLEXITY:-complexity:standard}}"
+          TYPE="${H_TYPE:-${L_TYPE:-type:enhancement}}"
+          {
+            echo "phase=$PHASE"
+            echo "complexity=$COMPLEXITY"
+            echo "type=$TYPE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Proposed labels: $PHASE / $COMPLEXITY / $TYPE"
+
+      - name: Apply labels (only ADD)
+        env:
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          PROPOSE_PHASE: ${{ steps.compose.outputs.phase }}
+          PROPOSE_COMPLEXITY: ${{ steps.compose.outputs.complexity }}
+          PROPOSE_TYPE: ${{ steps.compose.outputs.type }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash groomer/scripts/apply-labels.sh
